@@ -1,0 +1,3 @@
+msal
+msgraph-sdk
+requests
