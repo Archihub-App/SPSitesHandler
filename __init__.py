@@ -32,20 +32,43 @@ domain = os.environ.get("SITE_DOMAIN", '')
 class ExtendedPluginClass(PluginClass):
     def __init__(self, path, import_name, name, description, version, author, type, settings, actions=None, capabilities=None, **kwargs):
         super().__init__(path, __file__, import_name, name, description, version, author, type, settings, actions=actions, capabilities=capabilities, **kwargs)
-        
-    def download_file(self, drive_id, item_id, file_name):
+
+    def download_file(self, drive_id, item_id, output_path, parent_resource=None, user=None):
+        def modify_dict(d, path, value):
+            keys = path.split('.')
+            for key in keys[:-1]:
+                d = d.setdefault(key, {})
+            d[keys[-1]] = value
+            
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
         headers = self.get_headers()
         try:
             response = requests.get(url, headers=headers, stream=True)
             response.raise_for_status()
-            with open(file_name, 'wb') as f:
+            with open(output_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            print(f"Downloaded {file_name} successfully to {os.getcwd()}")
+                        
+            data = {}
+            filename = output_path.split('/')[-1]
+            modify_dict(data, 'metadata.firstLevel.title', filename)
+            data['post_type'] = 'unidad-documental'
+            data['parent'] = [{'id': parent_resource}] if parent_resource else []
+            data['parents'] = [{'id': parent_resource}] if parent_resource else []
+            data['status'] = 'published'
+            data['createdBy'] = user
+            data['filesIds'] = [{
+                'file': 0,
+                'filetag': 'sharepoint',
+            }]
+            
+            from app.api.resources.services import create as create_resource
+            create_resource(data, user, [{'file': output_path, 'filename': filename}])
+
+            print(f"Downloaded {output_path} successfully to {os.getcwd()}")
         except requests.exceptions.HTTPError as e:
-            print(f"Error downloading {file_name}: {e}")
+            print(f"Error downloading {output_path}: {e}")
             print(f"Response: {response.text}")
 
     def get_file_name_by_id(self, drive_id, item_id):
@@ -116,24 +139,23 @@ class ExtendedPluginClass(PluginClass):
         return drive_list
  
     @shared_task(ignore_result=False, name='sharepointSites.bulkUpdate')
-    def bulk_update(site, resource_id=None):
+    def bulk_update(site, folder_id=None, resource_id=None, user=None):
         instance = ExtendedPluginClass('sharepointSites','', **plugin_info, isTask=True)
         drive_list = instance.get_drive_id(site)
         headers = instance.get_headers()
         
         drive_id = None
         for drive in drive_list:
-            if drive.get('name') == 'Documents':
+            print(drive.get('name'))
+            if drive.get('name') == 'Documentos':
                 drive_id = drive.get('id')
                 break
         
         if not drive_id:
-            print(f"No 'Documents' drive found for site {site}")
+            print(f"No 'Documentos' drive found for site {site}")
             return {'msg': 'No "Documents" drive found for the specified site.'}
-        
-        
 
-        content = instance.get_folders_content(drive_id, folder_id='root' if not resource_id else resource_id)
+        content = instance.get_folders_content(drive_id, folder_id='root' if not folder_id else folder_id)
         total_files = 0
         
         for file in content:
@@ -143,8 +165,8 @@ class ExtendedPluginClass(PluginClass):
                 file_id = file['id']
                 output_file = f"{TEMPORAL_FILES_PATH}/{file_name}"
                 print(f"Downloading file {file_name} with ID {file_id} to {output_file}")
-                instance.download_file(drive_id, file_id, output_file)
-                
+                instance.download_file(drive_id, file_id, output_file, parent_resource=resource_id, user=user)
+
         return f"Downloaded {total_files} files from SharePoint site {site}."
 
     def add_routes(self):
@@ -163,18 +185,25 @@ class ExtendedPluginClass(PluginClass):
 
                     site = current['sharepoint_site']
                     
-                    body = request.get_json()
+                    body = request.get_json(force=True)
                     folder_id = body.get('folders_tree', None)
+                    resource_id = body.get('sharepoint_resource_id', None)
+
                     if not site:
                         return {'msg': 'Site parameter is required'}, 400
                     if not folder_id:
                         return {'msg': 'Folder ID parameter is required'}, 400
+                    if not resource_id:
+                        return {'msg': 'Resource ID parameter is required'}, 400
                     
                     folder_id = folder_id[0]['id'] if isinstance(folder_id, list) and len(folder_id) > 0 else folder_id
                     
+                    resource = mongodb.get_record('resources', {'_id': ObjectId(resource_id)})
+                    if not resource:
+                        return {'msg': 'Recurso no encontrado'}, 404
+                    
                     print(f"Downloading resources from SharePoint site: {site}, folder_id: {folder_id}")
-                    print(body)
-                    task = self.bulk_update.delay(site, folder_id)
+                    task = self.bulk_update.delay(site, folder_id, resource_id, current_user)
                     self.add_task_to_user(task.id, 'SPSitesHandler.bulkUpdate', current_user, 'msg', {
                         'site': site,
                         'folder_id': folder_id
@@ -198,7 +227,7 @@ class ExtendedPluginClass(PluginClass):
                         return {'msg': 'Configuración de SharePoint incompleta'}, 400
 
                     site = current['sharepoint_site']
-                    body = request.get_json()
+                    body = request.get_json(force=True)
                     folder_id = body.get('folder_id', 'root')
                     if not site:
                         return {'msg': 'Site parameter is required'}, 400
@@ -207,17 +236,15 @@ class ExtendedPluginClass(PluginClass):
                         return {'msg': 'No tiene permisos suficientes'}, 401
                     
                     drive_list = self.get_drive_id(site)
-            
+                    
                     drive_id = None
                     for drive in drive_list:
-                        if drive.get('name') == 'Documents':
+                        if drive.get('name') == 'Documentos':
                             drive_id = drive.get('id')
                             break
                     
                     if not drive_id:
                         return {'msg': 'No "Documents" drive found for the specified site.'}
-                    
-                    
 
                     content = self.get_folders_content(drive_id, folder_id)
                     tree = [{'id': item['id'], 'name': item['name'], 'post_type': item['type']} for item in content]
@@ -280,7 +307,6 @@ class ExtendedPluginClass(PluginClass):
                     return resp
                 elif type == 'settings':
                     resp['settings'][0]['default'] = current['sharepoint_site'] if 'sharepoint_site' in current else ''
-                    resp['settings'][1]['default'] = current['sharepoint_resource_id'] if 'sharepoint_resource_id' in current else ''
                     return resp['settings']
                 else:
                     return resp['settings_' + type]
@@ -322,13 +348,6 @@ plugin_info = {
                 'id': 'sharepoint_site',
                 'default': 'my-site',
                 'required': True
-            },
-            {
-                'type': 'text',
-                'label': 'ID del recurso a descargar',
-                'id': 'sharepoint_resource_id',
-                'default': 'my-resource-id',
-                'required': False
             }
         ],
         'settings_control': [
@@ -343,6 +362,12 @@ plugin_info = {
                 'api': 'get_folder',
                 'label': 'Estructura de carpetas',
                 'description': 'Aquí se mostrará la estructura de carpetas del sitio de SharePoint'
+            },
+            {
+                'type': 'text',
+                'label': 'ID del recurso donde guardar los archivos descargados',
+                'id': 'sharepoint_resource_id',
+                'required': True,
             },
             {
                 'type': 'button',
