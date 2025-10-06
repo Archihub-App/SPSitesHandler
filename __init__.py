@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from app.utils.FernetAuth import fernetAuthenticate
 import requests
 import msal
+import hashlib
  
 load_dotenv()
 mongodb = DatabaseHandler.DatabaseHandler()
@@ -49,22 +50,40 @@ class ExtendedPluginClass(PluginClass):
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-                        
+            
+            hash = hashlib.sha256()
+            with open(output_path, "rb") as f:
+                while chunk := f.read(8192):
+                    hash.update(chunk)
+                    
             data = {}
             filename = output_path.split('/')[-1]
-            modify_dict(data, 'metadata.firstLevel.title', filename)
-            data['post_type'] = 'unidad-documental'
-            data['parent'] = [{'id': parent_resource}] if parent_resource else []
-            data['parents'] = [{'id': parent_resource}] if parent_resource else []
-            data['status'] = 'published'
-            data['createdBy'] = user
-            data['filesIds'] = [{
-                'file': 0,
-                'filetag': 'sharepoint',
-            }]
             
-            from app.api.resources.services import create as create_resource
-            create_resource(data, user, [{'file': output_path, 'filename': filename}])
+            file_resource = mongodb.get_record('resources', {'metadata.firstLevel.title': filename, 'post_type': 'unidad-documental'})
+            if file_resource:
+                print(f"File {filename} already exists in the database. Skipping creation.")
+                from app.api.records.services import get_hash
+                existing_hash = get_hash(hash)
+                if existing_hash:
+                    print(f"File {filename} already exists with the same hash. Skipping file upload.")
+                else:
+                    print(f"File {filename} exists but with a different hash. Uploading new version.")
+            else:
+                modify_dict(data, 'metadata.firstLevel.title', filename)
+                data['post_type'] = 'unidad-documental'
+                data['parent'] = [{'id': parent_resource}] if parent_resource else []
+                data['parents'] = [{'id': parent_resource}] if parent_resource else []
+                data['status'] = 'published'
+                data['createdBy'] = user
+                data['filesIds'] = [{
+                    'file': 0,
+                    'filetag': 'sharepoint',
+                }]
+            
+                from app.api.resources.services import create as create_resource
+                create_resource(data, user, [{'file': output_path, 'filename': filename}])
+                
+            os.remove(output_path)
 
             print(f"Downloaded {output_path} successfully to {os.getcwd()}")
         except requests.exceptions.HTTPError as e:
@@ -146,7 +165,6 @@ class ExtendedPluginClass(PluginClass):
         
         drive_id = None
         for drive in drive_list:
-            print(drive.get('name'))
             if drive.get('name') == 'Documentos':
                 drive_id = drive.get('id')
                 break
@@ -155,17 +173,40 @@ class ExtendedPluginClass(PluginClass):
             print(f"No 'Documentos' drive found for site {site}")
             return {'msg': 'No "Documents" drive found for the specified site.'}
 
-        content = instance.get_folders_content(drive_id, folder_id='root' if not folder_id else folder_id)
         total_files = 0
         
-        for file in content:
-            if file['type'] == 'file':
-                total_files += 1
-                file_name = file['name']
-                file_id = file['id']
-                output_file = f"{TEMPORAL_FILES_PATH}/{file_name}"
-                print(f"Downloading file {file_name} with ID {file_id} to {output_file}")
-                instance.download_file(drive_id, file_id, output_file, parent_resource=resource_id, user=user)
+        def modify_dict(d, path, value):
+            keys = path.split('.')
+            for key in keys[:-1]:
+                d = d.setdefault(key, {})
+            d[keys[-1]] = value
+        
+        def iterate_folder(folder_id, resource_id=resource_id):
+            nonlocal total_files
+            content = instance.get_folders_content(drive_id, folder_id=folder_id)
+            for file in content:
+                if file['type'] == 'file':
+                    total_files += 1
+                    file_name = file['name']
+                    file_id = file['id']
+                    output_file = f"{TEMPORAL_FILES_PATH}/{file_name}"
+                    print(f"Downloading file {file_name} with ID {file_id} to {output_file}")
+                    instance.download_file(drive_id, file_id, output_file, parent_resource=resource_id, user=user)
+                elif file['type'] == 'folder':
+                    print(f"Entering folder {file['name']} with ID {file['id']}")
+                    data = {}
+                    modify_dict(data, 'metadata.firstLevel.title', file['name'])
+                    data['post_type'] = 'fondo'
+                    data['parent'] = [{'id': resource_id}] if resource_id else []
+                    data['parents'] = [{'id': resource_id}] if resource_id else []
+                    data['status'] = 'published'
+                    data['createdBy'] = user
+                    from app.api.resources.services import create as create_resource
+                    new_resource = create_resource(data, user)
+                    resource_id_new = str(new_resource['_id'])
+                    iterate_folder(file['id'], resource_id=resource_id_new)
+        
+        iterate_folder(folder_id if folder_id else 'root')
 
         return f"Downloaded {total_files} files from SharePoint site {site}."
 
@@ -225,6 +266,8 @@ class ExtendedPluginClass(PluginClass):
                 if 'sharepoint_site' in current:
                     if current['sharepoint_site'] == '':
                         return {'msg': 'Configuración de SharePoint incompleta'}, 400
+                    if current['sharepoint_drive'] == '':
+                        return {'msg': 'Configuración de SharePoint incompleta'}, 400
 
                     site = current['sharepoint_site']
                     body = request.get_json(force=True)
@@ -239,12 +282,12 @@ class ExtendedPluginClass(PluginClass):
                     
                     drive_id = None
                     for drive in drive_list:
-                        if drive.get('name') == 'Documentos':
+                        if drive.get('name') == current['sharepoint_drive']:
                             drive_id = drive.get('id')
                             break
                     
                     if not drive_id:
-                        return {'msg': 'No "Documents" drive found for the specified site.'}
+                        return {'msg': f'No "{current["sharepoint_drive"]}" drive found for the specified site.'}
 
                     content = self.get_folders_content(drive_id, folder_id)
                     tree = [{'id': item['id'], 'name': item['name'], 'post_type': item['type']} for item in content]
@@ -307,6 +350,19 @@ class ExtendedPluginClass(PluginClass):
                     return resp
                 elif type == 'settings':
                     resp['settings'][0]['default'] = current['sharepoint_site'] if 'sharepoint_site' in current else ''
+                    resp['settings'][1]['default'] = current['sharepoint_drive'] if 'sharepoint_drive' in current else ''
+                    
+                    from app.api.types.services import get_all as get_all_types
+                    types = get_all_types()
+                    if isinstance(types, list):
+                        types = tuple(types)[0]
+                    type_options = [{'value': t['slug'], 'label': t['name']} for t in types]
+                    resp['settings'][2]['options'] = type_options
+                    resp['settings'][3]['options'] = type_options
+                    
+                    resp['settings'][2]['default'] = current['post_type'] if 'post_type' in current else (type_options[0]['value'] if len(type_options) > 0 else '')
+                    resp['settings'][3]['default'] = current['folder_post_type'] if 'folder_post_type' in current else (type_options[0]['value'] if len(type_options) > 0 else '')
+                    
                     return resp['settings']
                 else:
                     return resp['settings_' + type]
@@ -346,7 +402,30 @@ plugin_info = {
                 'type': 'text',
                 'label': 'Sitio de SharePoint',
                 'id': 'sharepoint_site',
-                'default': 'my-site',
+                'default': '',
+                'required': True
+            },
+            {
+                'type': 'text',
+                'label': 'Nombre de la biblioteca de documentos',
+                'id': 'sharepoint_drive',
+                'default': '',
+                'required': True
+            },
+            {
+                'type': 'select',
+                'label': 'Tipo de contenido para los archivos descargados',
+                'id': 'post_type',
+                'default': '',
+                'options': [],
+                'required': True
+            },
+            {
+                'type': 'select',
+                'label': 'Tipo de contenido para las carpetas',
+                'id': 'folder_post_type',
+                'default': '',
+                'options': [],
                 'required': True
             }
         ],
